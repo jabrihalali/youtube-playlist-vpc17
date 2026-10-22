@@ -1,4 +1,3 @@
-```
 import os, io, json, time, random
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -272,4 +271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
