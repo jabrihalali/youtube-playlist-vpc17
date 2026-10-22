@@ -1,9 +1,14 @@
-import os, io, json, time, random
-from google.oauth2.credentials import Credentials
+import io
+import json
+import os
+import random
+import time
+import urllib.request
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 SHEET_ID = os.environ["SHEET_ID"]
 FIXED_VIDEO_ID = os.environ.get("FIXED_VIDEO_ID", "TtLaH4OASWI").strip()
@@ -11,7 +16,7 @@ INTRO_VIDEO_ID = os.environ.get("INTRO_VIDEO_ID", "u5fkWFh9wAM").strip()
 MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "1"))
 TOTAL = 15  # videos per playlist: #1 intro, #2 fixed, #3-15 related
 
-# Vpc17 sheet layout: A=Title, B=Description, C=Est. Monthly Searches, D=Status
+# Sheet layout: A=Title, B=Description, C=Est. Monthly Searches, D=Status
 STATUS_COL = 3  # 0-based index of the Status column (D)
 
 
@@ -71,8 +76,11 @@ def search_video_ids(yt, query, max_results=25, exclude=()):
     for attempt in range(5):
         try:
             resp = yt.search().list(
-                part="snippet", q=query, type="video",
-                maxResults=max_results, safeSearch="none",
+                part="snippet",
+                q=query,
+                type="video",
+                maxResults=max_results,
+                safeSearch="none",
             ).execute()
             ids = []
             for item in resp.get("items", []):
@@ -105,7 +113,6 @@ def upload_thumbnail(youtube, playlist_id, query):
         ids = search_video_ids(youtube, query, max_results=1)
         if not ids:
             return
-        import urllib.request
         for quality in ("maxresdefault", "hqdefault"):
             url = f"https://i.ytimg.com/vi/{ids[0]}/{quality}.jpg"
             try:
@@ -132,14 +139,23 @@ def find_my_playlist_by_title(yt, title):
     best = (None, [])
     page = None
     while True:
-        ok, resp = api_call(yt.playlists().list, part="snippet", mine=True,
-                            maxResults=50, pageToken=page)
+        ok, resp = api_call(
+            yt.playlists().list,
+            part="snippet",
+            mine=True,
+            maxResults=50,
+            pageToken=page,
+        )
         if not ok or resp is None:
             return best
         for pl in resp.get("items", []):
             if pl["snippet"]["title"].strip() == title.strip():
-                ok2, items = api_call(yt.playlistItems().list, part="contentDetails",
-                                      playlistId=pl["id"], maxResults=50)
+                ok2, items = api_call(
+                    yt.playlistItems().list,
+                    part="contentDetails",
+                    playlistId=pl["id"],
+                    maxResults=50,
+                )
                 vids = []
                 if ok2 and items:
                     vids = [it["contentDetails"]["videoId"] for it in items.get("items", [])]
@@ -155,104 +171,15 @@ def add_videos(yt, playlist_id, video_ids, start_pos):
     last successfully added video, or -1 on quota stop."""
     pos = start_pos
     for vid in video_ids:
-        ok, _ = api_call(yt.playlistItems().insert, part="snippet", body={
-            "snippet": {"playlistId": playlist_id,
-                        "resourceId": {"kind": "youtube#video", "videoId": vid},
-                        "position": pos}})
+        ok, _ = api_call(
+            yt.playlistItems().insert,
+            part="snippet",
+            body={
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "resourceId": {"kind": "youtube#video", "videoId": vid},
+                    "position": pos,
+                }
+            },
+        )
         if not ok:
-            return -1
-        pos += 1
-    return pos
-
-
-def build_related(yt, title, exclude):
-    """Related videos for positions #3..: search by the sheet title."""
-    related = search_video_ids(yt, title, max_results=40, exclude=exclude)
-    random.seed(hash(title) & 0xffffffff)
-    random.shuffle(related)
-    return related
-
-
-def main():
-    yt, gs = get_services()
-
-    ok, sheet = api_call(gs.spreadsheets().values().get,
-                         spreadsheetId=SHEET_ID, range="Sheet1!A:D")
-    if not ok or sheet is None:
-        print("Could not read sheet — aborting")
-        return
-    rows = sheet.get("values", [])
-    if not rows:
-        print("Sheet is empty")
-        return
-
-    processed = 0
-    for i, row in enumerate(rows):
-        if processed >= MAX_PER_RUN:
-            break
-        if i == 0:
-            continue  # header
-        title = row[0].strip() if len(row) > 0 else ""
-        desc = row[1] if len(row) > 1 else ""
-        status = row[STATUS_COL].strip() if len(row) > STATUS_COL else ""
-        if not title or status.lower() == "done":
-            continue
-
-        print(f"\n=== Row {i+1}: {title} ===")
-        try:
-            existing_id, existing_vids = find_my_playlist_by_title(yt, title)
-            start = [INTRO_VIDEO_ID, FIXED_VIDEO_ID] if FIXED_VIDEO_ID else [INTRO_VIDEO_ID]
-
-            if existing_id and existing_vids[:len(start)] == start:
-                # RESUME an interrupted playlist instead of duplicating it
-                print(f"Resuming existing playlist {existing_id} "
-                      f"({len(existing_vids)}/{TOTAL} videos)")
-                pid, have = existing_id, list(existing_vids)
-                if len(have) >= TOTAL:
-                    print("Already complete — just marking Done")
-                else:
-                    related = build_related(yt, title, exclude=set(have))
-                    need = TOTAL - len(have)
-                    nxt = add_videos(yt, pid, related[:need], len(have))
-                    if nxt == -1:
-                        print("Stopped mid-resume (quota) — will continue next run")
-                        return
-            elif existing_id:
-                print("A playlist with this title exists but its start does not "
-                      "match the spec — leaving it untouched, skipping row")
-                continue
-            else:
-                ok, pl = api_call(yt.playlists().insert, part="snippet,status", body={
-                    "snippet": {"title": title, "description": desc},
-                    "status": {"privacyStatus": "public"}})
-                if not ok or pl is None:
-                    print("Playlist create failed/quota — will retry next run")
-                    return
-                pid = pl["id"]
-                print(f"Created playlist {pid}")
-                nxt = add_videos(yt, pid, start, 0)
-                if nxt == -1:
-                    print("Stopped after create (quota) — will resume next run")
-                    return
-                upload_thumbnail(yt, pid, title)
-                related = build_related(yt, title, exclude=set(start))
-                nxt = add_videos(yt, pid, related[:TOTAL - len(start)], len(start))
-                if nxt == -1:
-                    print("Stopped mid-build (quota) — will resume next run")
-                    return
-
-            ok, _ = api_call(gs.spreadsheets().values().update,
-                             spreadsheetId=SHEET_ID, range=f"Sheet1!D{i+1}",
-                             valueInputOption="RAW", body={"values": [["Done"]]})
-            if ok:
-                print(f"Row {i+1} marked Done")
-                processed += 1
-        except HttpError as e:
-            if "quota" in str(e).lower():
-                print("Quota hit — stopping; next run resumes this title")
-                return
-            raise
-
-
-if __name__ == "__main__":
-    main()
